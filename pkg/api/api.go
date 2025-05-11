@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"gateway/pkg/models"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -29,6 +31,9 @@ type APIUrls struct {
 
 	// Микросервис комментариев
 	Comments string
+
+	// Микросервис цензуры
+	Censor string
 }
 
 // Программный интерфейс сервера
@@ -53,12 +58,12 @@ func (api *API) endpoints() {
 	api.router.Use(requestIdValidator)
 	api.router.Use(requestLogger)
 
-	api.router.Path("/news").Methods(http.MethodGet).Handler(requestProxy(api.urls.News))
-	api.router.Path("/comments").Methods(http.MethodPost).Handler(requestProxy(api.urls.Comments))
-	api.router.HandleFunc("/news/{id}", api.news).Methods(http.MethodGet)
+	api.router.Methods(http.MethodGet).Path("/news").Handler(requestProxy(api.urls.News))
+	api.router.Methods(http.MethodPost).Path("/comments").Handler(api.commentsValidator(requestProxy(api.urls.Comments)))
+	api.router.Methods(http.MethodGet).Path("/news/{id}").HandlerFunc(api.newsDetails)
 }
 
-func (api *API) news(w http.ResponseWriter, r *http.Request) {
+func (api *API) newsDetails(w http.ResponseWriter, r *http.Request) {
 	newsId := mux.Vars(r)["id"]
 	if newsId == "" {
 		http.Error(w, "Id expected", http.StatusBadRequest)
@@ -169,6 +174,31 @@ func requestLogger(next http.Handler) http.Handler {
 			status_w.status,
 			time.Now().Format(d_format),
 		)
+	})
+}
+
+func (api *API) commentsValidator(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		r.Body = io.NopCloser(bytes.NewBuffer(body))
+
+		v_resp, err := http.Post(api.urls.Censor+"/comments/validate", "application/json", bytes.NewReader(body))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if v_resp.StatusCode != http.StatusOK {
+			http.Error(w, "Bad words were found", http.StatusBadRequest)
+			return
+		}
+
+		next.ServeHTTP(w, r)
 	})
 }
 

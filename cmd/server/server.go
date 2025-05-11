@@ -23,8 +23,13 @@ func main() {
 		log.Fatal("No environment for COMMENTS_HOST")
 	}
 
+	censor_host := os.Getenv("CENSOR_HOST")
+	if censor_host == "" {
+		log.Fatal("No environment for CENSOR_HOST")
+	}
+
 	// Запускаем API
-	apiUrls := api.APIUrls{News: news_host, Comments: comments_host}
+	apiUrls := api.APIUrls{News: news_host, Comments: comments_host, Censor: censor_host}
 	api := api.NewApi(apiUrls)
 	log.Print("Server is starting...")
 	http.ListenAndServe(":8080", api.Router())
