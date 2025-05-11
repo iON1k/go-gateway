@@ -2,26 +2,33 @@ package api
 
 import (
 	"encoding/json"
-	"gateway/pkg/comments"
 	"gateway/pkg/models"
-	"gateway/pkg/news"
 	"net/http"
-	"strconv"
+	"net/http/httputil"
+	"net/url"
 	"sync"
 
 	"github.com/gorilla/mux"
 )
 
+// Набор URL для API
+type APIUrls struct {
+	// Микросервис новостей
+	News string
+
+	// Микросервис комментариев
+	Comments string
+}
+
 // Программный интерфейс сервера
 type API struct {
-	newsService     news.Service
-	commentsService comments.Service
-	router          *mux.Router
+	urls   APIUrls
+	router *mux.Router
 }
 
 // Конструктор объекта API
-func NewApi(newsService news.Service, commentsService comments.Service) *API {
-	api := API{newsService, commentsService, mux.NewRouter()}
+func NewApi(urls APIUrls) *API {
+	api := API{urls, mux.NewRouter()}
 	api.endpoints()
 	return &api
 }
@@ -32,58 +39,15 @@ func (api *API) Router() *mux.Router {
 }
 
 func (api *API) endpoints() {
-	api.router.HandleFunc("/news/latest", api.latestNews).Methods(http.MethodGet)
-	api.router.HandleFunc("/news/filter", api.filteredNews).Methods(http.MethodGet)
+	api.router.Path("/news/latest").Methods(http.MethodGet).Handler(proxyHandler(api.urls.News))
+	api.router.Path("/news/filtered").Methods(http.MethodGet).Handler(proxyHandler(api.urls.News))
+	api.router.Path("/comments").Methods(http.MethodPost).Handler(proxyHandler(api.urls.Comments))
 	api.router.HandleFunc("/news/{id}", api.news).Methods(http.MethodGet)
-	api.router.HandleFunc("/news/{id}/comments", api.postComment).Methods(http.MethodPost)
-}
-
-func (api *API) latestNews(w http.ResponseWriter, r *http.Request) {
-	pageStr := r.URL.Query().Get("page")
-	page, err := strconv.Atoi(pageStr)
-	if err != nil {
-		http.Error(w, "Page expected", http.StatusBadRequest)
-		return
-	}
-
-	news, err := api.newsService.LatestNews(page)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	json.NewEncoder(w).Encode(news)
-}
-
-func (api *API) filteredNews(w http.ResponseWriter, r *http.Request) {
-	title := r.URL.Query().Get("title")
-
-	fromStr := r.URL.Query().Get("from")
-	from, _ := strconv.ParseInt(fromStr, 10, 64)
-
-	toStr := r.URL.Query().Get("to")
-	to, _ := strconv.ParseInt(toStr, 10, 64)
-
-	countStr := r.URL.Query().Get("count")
-	count, err := strconv.Atoi(countStr)
-	if err != nil {
-		http.Error(w, "Count expected", http.StatusBadRequest)
-		return
-	}
-
-	news, err := api.newsService.FilteredNews(title, from, to, count)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	json.NewEncoder(w).Encode(news)
 }
 
 func (api *API) news(w http.ResponseWriter, r *http.Request) {
-	idStr := mux.Vars(r)["id"]
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
+	newsId := mux.Vars(r)["id"]
+	if newsId == "" {
 		http.Error(w, "Id expected", http.StatusBadRequest)
 		return
 	}
@@ -91,20 +55,31 @@ func (api *API) news(w http.ResponseWriter, r *http.Request) {
 	var news models.FullNews
 	var newsErr error
 
-	var comments []models.Comment
+	var comments models.NewsComments
 	var commentsErr error
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
-		news, newsErr = api.newsService.News(id)
-		wg.Done()
+		defer wg.Done()
+		url, err := makeUrl(api.urls.News, "/news/"+newsId, nil)
+		if err != nil {
+			commentsErr = err
+			return
+		}
+		newsErr = getData(url, &news)
 	}()
 
 	go func() {
-		comments, commentsErr = api.commentsService.Comments(id)
-		wg.Done()
+		defer wg.Done()
+		url, err := makeUrl(api.urls.Comments, "/comments", map[string]string{"news_id": newsId})
+		if err != nil {
+			commentsErr = err
+			return
+		}
+
+		commentsErr = getData(url, &comments)
 	}()
 
 	wg.Wait()
@@ -119,36 +94,51 @@ func (api *API) news(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newsWithComments := models.FullNewsWithComments{
-		ID:       news.ID,
-		Title:    news.Title,
-		Content:  news.Content,
-		PubTime:  news.PubTime,
-		Link:     news.Link,
-		Comments: comments,
+	result := models.FullNewsWithComments{
+		ID:          news.ID,
+		Title:       news.Title,
+		Content:     news.Content,
+		PubTime:     news.PubTime,
+		Link:        news.Link,
+		Comments:    comments.Comments,
+		Subcomments: comments.Subcomments,
 	}
 
-	json.NewEncoder(w).Encode(newsWithComments)
+	json.NewEncoder(w).Encode(result)
 }
 
-func (api *API) postComment(w http.ResponseWriter, r *http.Request) {
-	idStr := mux.Vars(r)["id"]
-	newsId, err := strconv.Atoi(idStr)
+func proxyHandler(target string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		targetURL, err := url.Parse(target)
+		if err != nil {
+			http.Error(w, "Bad target URL", http.StatusInternalServerError)
+			return
+		}
+
+		proxy := httputil.NewSingleHostReverseProxy(targetURL)
+		r.Host = targetURL.Host
+		proxy.ServeHTTP(w, r)
+	}
+}
+
+func getData[T any](url string, target *T) error {
+	r, err := http.Get(url)
 	if err != nil {
-		http.Error(w, "Id expected", http.StatusBadRequest)
-		return
+		return err
+	}
+	return json.NewDecoder(r.Body).Decode(target)
+}
+
+func makeUrl(base string, endpoint string, params map[string]string) (string, error) {
+	req_url, err := url.Parse(base + endpoint)
+	if err != nil {
+		return "", err
+	}
+	values := url.Values{}
+	for k, v := range params {
+		values.Add(k, v)
 	}
 
-	var comment models.Comment
-	err = json.NewDecoder(r.Body).Decode(&comment)
-	if err != nil {
-		http.Error(w, "Comment decoding error", http.StatusBadRequest)
-		return
-	}
-
-	err = api.commentsService.PostComment(newsId, comment)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	req_url.RawQuery = values.Encode()
+	return req_url.String(), nil
 }

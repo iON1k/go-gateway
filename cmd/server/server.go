@@ -1,0 +1,31 @@
+package main
+
+import (
+	"gateway/pkg/api"
+	"log"
+	"net/http"
+	"os"
+
+	"github.com/joho/godotenv"
+)
+
+func main() {
+	// Загружаем файл окружения
+	godotenv.Load()
+
+	news_host := os.Getenv("NEWS_HOST")
+	if news_host == "" {
+		log.Fatal("No environment for NEWS_HOST")
+	}
+
+	comments_host := os.Getenv("COMMENTS_HOST")
+	if comments_host == "" {
+		log.Fatal("No environment for COMMENTS_HOST")
+	}
+
+	// Запускаем API
+	apiUrls := api.APIUrls{News: news_host, Comments: comments_host}
+	api := api.NewApi(apiUrls)
+	log.Print("Starting server...")
+	http.ListenAndServe(":8080", api.Router())
+}
