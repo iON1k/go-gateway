@@ -26,6 +26,7 @@ func main() {
 	// Запускаем API
 	apiUrls := api.APIUrls{News: news_host, Comments: comments_host}
 	api := api.NewApi(apiUrls)
-	log.Print("Starting server...")
+	log.Print("Server is starting...")
 	http.ListenAndServe(":8080", api.Router())
+	log.Print("Server has been stopped.")
 }

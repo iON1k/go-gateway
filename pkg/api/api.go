@@ -1,15 +1,26 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"gateway/pkg/models"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"sync"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 )
+
+type ctxRequestIdKey struct{}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
 
 // Набор URL для API
 type APIUrls struct {
@@ -39,9 +50,11 @@ func (api *API) Router() *mux.Router {
 }
 
 func (api *API) endpoints() {
-	api.router.Path("/news/latest").Methods(http.MethodGet).Handler(proxyHandler(api.urls.News))
-	api.router.Path("/news/filtered").Methods(http.MethodGet).Handler(proxyHandler(api.urls.News))
-	api.router.Path("/comments").Methods(http.MethodPost).Handler(proxyHandler(api.urls.Comments))
+	api.router.Use(requestIdValidator)
+	api.router.Use(requestLogger)
+
+	api.router.Path("/news").Methods(http.MethodGet).Handler(requestProxy(api.urls.News))
+	api.router.Path("/comments").Methods(http.MethodPost).Handler(requestProxy(api.urls.Comments))
 	api.router.HandleFunc("/news/{id}", api.news).Methods(http.MethodGet)
 }
 
@@ -63,17 +76,14 @@ func (api *API) news(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		defer wg.Done()
-		url, err := makeUrl(api.urls.News, "/news/"+newsId, nil)
-		if err != nil {
-			commentsErr = err
-			return
-		}
+		url := api.urls.News + "/news/" + newsId
 		newsErr = getData(url, &news)
 	}()
 
 	go func() {
 		defer wg.Done()
-		url, err := makeUrl(api.urls.Comments, "/comments", map[string]string{"news_id": newsId})
+		url := api.urls.Comments + "/comments"
+		url, err := addQueryToString(url, map[string]string{"news_id": newsId})
 		if err != nil {
 			commentsErr = err
 			return
@@ -107,7 +117,7 @@ func (api *API) news(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(result)
 }
 
-func proxyHandler(target string) http.HandlerFunc {
+func requestProxy(target string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		targetURL, err := url.Parse(target)
 		if err != nil {
@@ -121,6 +131,47 @@ func proxyHandler(target string) http.HandlerFunc {
 	}
 }
 
+func requestIdValidator(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r_key := "request_id"
+		url := r.URL
+		req_id := url.Query().Get(r_key)
+		if req_id == "" {
+			req_id = uuid.New().String()
+			addQueryToUrl(url, map[string]string{r_key: req_id})
+		}
+
+		ctx := context.WithValue(r.Context(), ctxRequestIdKey{}, req_id)
+
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req_id := getRequestId(r.Context())
+		d_format := "2006-01-02 15:04:05"
+
+		log.Printf(
+			"REQUEST - ID: %v IP: %v TIME: %v",
+			req_id,
+			r.RemoteAddr,
+			time.Now().Format(d_format),
+		)
+
+		status_w := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+
+		next.ServeHTTP(status_w, r)
+
+		log.Printf(
+			"RESPONSE - ID: %v STATIS: %v TIME %v",
+			req_id,
+			status_w.status,
+			time.Now().Format(d_format),
+		)
+	})
+}
+
 func getData[T any](url string, target *T) error {
 	r, err := http.Get(url)
 	if err != nil {
@@ -129,16 +180,29 @@ func getData[T any](url string, target *T) error {
 	return json.NewDecoder(r.Body).Decode(target)
 }
 
-func makeUrl(base string, endpoint string, params map[string]string) (string, error) {
-	req_url, err := url.Parse(base + endpoint)
+func addQueryToString(url_s string, params map[string]string) (string, error) {
+	r_url, err := url.Parse(url_s)
 	if err != nil {
 		return "", err
 	}
-	values := url.Values{}
+
+	addQueryToUrl(r_url, params)
+	return r_url.String(), nil
+}
+
+func addQueryToUrl(url *url.URL, params map[string]string) {
+	q := url.Query()
 	for k, v := range params {
-		values.Add(k, v)
+		q.Add(k, v)
 	}
 
-	req_url.RawQuery = values.Encode()
-	return req_url.String(), nil
+	url.RawQuery = q.Encode()
+}
+
+func getRequestId(ctx context.Context) string {
+	id, ok := ctx.Value(ctxRequestIdKey{}).(string)
+	if !ok {
+		return ""
+	}
+	return id
 }
